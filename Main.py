@@ -1,157 +1,129 @@
-# bot_and_server_fixed.py
+# file: video_proxy_bot.py
+# Requires: pip install python-telegram-bot==20.5
 import sqlite3
-import string
-import random
-from flask import Flask, g, render_template_string
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
-import asyncio
-import threading
-import os
+import secrets
+import html
+from telegram import Update, InputMediaVideo
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 
-# ========== CONFIG ==========
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN") or "8311890150:AAE2a13FqcmHMflWc_me4Z6cmv7FoIJ-XGs"
-ADMIN_ID = 7681308594  # optional
-# Agar BASE_URL nahi set hai to default localhost use karega
-BASE_URL = os.environ.get("BASE_URL", "http://localhost:5000")
-DB_PATH = "links.db"
-# ============================
+DB = "videos.db"
+BOT_USERNAME = "Oll_in_one_bot"   # without @, e.g. MyVideoProxyBot
+BOT_TOKEN = "8311890150:AAE2a13FqcmHMflWc_me4Z6cmv7FoIJ-XGs"
 
-app = Flask(__name__)
-
-# ---------- DB helpers ----------
-def get_db():
-    if not hasattr(g, "_database"):
-        g._database = sqlite3.connect(DB_PATH)
-        g._database.row_factory = sqlite3.Row
-    return g._database
-
+# --- DB helpers ---
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS groups (
-        id TEXT PRIMARY KEY,
-        title TEXT,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )
-    """)
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS links (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        group_id TEXT,
-        url TEXT,
-        label TEXT,
-        pos INTEGER DEFAULT 0,
-        FOREIGN KEY(group_id) REFERENCES groups(id)
+    conn = sqlite3.connect(DB)
+    cur = conn.cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS files (
+        token TEXT PRIMARY KEY,
+        file_id TEXT NOT NULL,
+        mime_type TEXT,
+        file_name TEXT,
+        channel_message_id INTEGER,
+        media_group_id TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
     """)
     conn.commit()
     conn.close()
 
-def make_id(n=6):
-    chars = string.ascii_letters + string.digits
-    return ''.join(random.choice(chars) for _ in range(n))
-
-def save_group(title, urls):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    gid = make_id()
-    while True:
-        c.execute("SELECT 1 FROM groups WHERE id=?", (gid,))
-        if c.fetchone():
-            gid = make_id()
-        else:
-            break
-    c.execute("INSERT INTO groups (id, title) VALUES (?, ?)", (gid, title))
-    for i, u in enumerate(urls):
-        c.execute("INSERT INTO links (group_id, url, label, pos) VALUES (?, ?, ?, ?)", (gid, u.strip(), u.strip(), i))
+def save_file(token, file_id, mime_type=None, file_name=None, channel_message_id=None, media_group_id=None):
+    conn = sqlite3.connect(DB)
+    cur = conn.cursor()
+    cur.execute("INSERT INTO files (token, file_id, mime_type, file_name, channel_message_id, media_group_id) VALUES (?, ?, ?, ?, ?, ?)",
+                (token, file_id, mime_type, file_name, channel_message_id, media_group_id))
     conn.commit()
     conn.close()
-    return gid
 
-def get_group(gid):
-    db = get_db()
-    grp = db.execute("SELECT * FROM groups WHERE id=?", (gid,)).fetchone()
-    if not grp:
-        return None
-    links = db.execute("SELECT * FROM links WHERE group_id=? ORDER BY pos", (gid,)).fetchall()
-    return {"id": grp["id"], "title": grp["title"], "links": links}
+def get_file(token):
+    conn = sqlite3.connect(DB)
+    cur = conn.cursor()
+    cur.execute("SELECT file_id, file_name FROM files WHERE token = ?", (token,))
+    row = cur.fetchone()
+    conn.close()
+    return row
 
-@app.teardown_appcontext
-def close_connection(exception):
-    db = getattr(g, "_database", None)
-    if db is not None:
-        db.close()
+# --- Utility ---
+def gen_token(nbytes=16):
+    return secrets.token_urlsafe(nbytes)
 
-# ---------- Flask page ----------
-TEMPLATE = """
-<!doctype html>
-<html><head>
-  <meta charset="utf-8">
-  <title>{{ title }}</title>
-  <style>
-    body { font-family:sans-serif; padding:20px; background:#fafafa; }
-    .card { max-width:600px; margin:auto; background:#fff; padding:20px; border-radius:12px; box-shadow:0 0 8px rgba(0,0,0,0.1); }
-    a { display:block; margin:8px 0; text-decoration:none; color:#007bff; }
-  </style>
-</head><body>
-  <div class="card">
-    <h2>{{ title }}</h2>
-    <p>Total links: {{ links|length }}</p><hr>
-    {% for l in links %}
-      <a href="{{ l['url'] }}" target="_blank">{{ l['label'] }}</a>
-    {% endfor %}
-  </div>
-</body></html>
-"""
-
-@app.route("/g/<gid>")
-def show_group(gid):
-    data = get_group(gid)
-    if not data:
-        return "Not found", 404
-    return render_template_string(TEMPLATE, title=data["title"], links=data["links"])
-
-# ---------- Telegram bot ----------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 Namaste! Mujhe ek ya multiple links bhejo (har ek alag line me).\n"
-        "Main tumhe ek short link dunga jo sabko dikhayega.\n\n"
-        "Example:\nhttps://a.com\nhttps://b.com"
-    )
-
-async def handle_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if ADMIN_ID and update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("⛔ Aap authorized nahi ho.")
+# --- Handlers ---
+async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # This receives posts made in the channel where bot is admin.
+    post = update.channel_post
+    if not post:
         return
 
-    text = update.message.text.strip()
-    urls = [l.strip() for l in text.splitlines() if l.strip().startswith(("http://", "https://"))]
-    if not urls:
-        await update.message.reply_text("Koi valid link nahi mila. Har link ko alag line me bhejo.")
+    # For single video as 'video' field
+    media_group = getattr(post, "media_group_id", None)
+    channel_msg_id = post.message_id
+
+    # Handle video, document, animation — treat these similarly
+    candidates = []
+    if post.video:
+        candidates.append(("video", post.video))
+    if post.document:
+        candidates.append(("document", post.document))
+    if post.animation:
+        candidates.append(("animation", post.animation))
+
+    # If post has caption_entities or media as attachment list, sometimes we may need to inspect
+    # If none found, ignore.
+    if not candidates:
         return
 
-    gid = save_group(f"Shared by {update.effective_user.first_name}", urls)
-    short_link = f"{BASE_URL}/g/{gid}"
-    await update.message.reply_text(f"✅ Ye lo aapka combined link:\n{short_link}")
+    # Save each candidate file and create token/link
+    links = []
+    for kind, obj in candidates:
+        file_id = obj.file_id
+        mime = getattr(obj, "mime_type", None)
+        fname = getattr(obj, "file_name", None)
+        token = gen_token()
+        save_file(token, file_id, mime_type=mime, file_name=fname, channel_message_id=channel_msg_id, media_group_id=media_group)
+        link = f"https://t.me/{BOT_USERNAME}?start={token}"
+        links.append((token, link))
 
-def run_flask():
-    app.run(host="0.0.0.0", port=5000)
+    # Optionally: reply in channel with the generated links (if you want), or log them somewhere.
+    # WARNING: if channel is private you might not want to post these links in the channel itself.
+    # Here we will send a confirmation to the bot owner (first ADMIN). Replace ADMIN_CHAT_ID with your chat id.
+    ADMIN_CHAT_ID = None  # set your Telegram user id here (int) if you want notifications
+    if ADMIN_CHAT_ID:
+        text = "Links generated for new channel post:\n" + "\n".join(f"{l}" for _, l in links)
+        await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=text)
 
-async def run_bot():
-    init_db()
-    bot = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    bot.add_handler(CommandHandler("start", start))
-    bot.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_links))
-    await bot.initialize()
-    await bot.start()
-    await bot.updater.wait_for_stop()
+async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if not args:
+        await update.message.reply_text("Hi! Provide a token link.")
+        return
+    token = args[0]
+    row = get_file(token)
+    if not row:
+        await update.message.reply_text("Invalid or expired link.")
+        return
+    file_id, file_name = row
+    # send the video/document by file_id so channel identity is not exposed
+    try:
+        # We don't know exact type saved; try send_video first, fall back to send_document
+        await context.bot.send_video(chat_id=update.effective_chat.id, video=file_id, caption=(file_name or "Video"))
+    except Exception:
+        # fallback
+        await context.bot.send_document(chat_id=update.effective_chat.id, document=file_id, caption=(file_name or "File"))
 
-def main():
-    init_db()
-    threading.Thread(target=run_flask, daemon=True).start()
-    asyncio.run(run_bot())
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Send me a token link (t.me/YourBot?start=TOKEN) and I'll send the video.")
 
+# --- Run bot ---
 if __name__ == "__main__":
-    main()
+    init_db()
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    # channel_post handler: receives posts that appear in channels where bot is admin
+    app.add_handler(MessageHandler(filters.CHANNEL, channel_post_handler))
+    # start handler /start TOKEN
+    app.add_handler(CommandHandler("start", start_handler))
+    app.add_handler(CommandHandler("help", help_cmd))
+
+    print("Bot running...")
+    app.run_polling()
